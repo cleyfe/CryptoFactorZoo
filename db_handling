@@ -1,0 +1,134 @@
+# Data handling
+import pandas as pd
+import numpy as np
+import datetime
+
+# API request
+import requests
+
+# Database management
+from sqlalchemy import create_engine
+
+
+
+# Append Coingecko data
+def append_coingecko(coin, currency, days, count, price, market_cap, volume):
+
+    cg_data_url = 'https://api.coingecko.com/api/v3/coins/' + coin + '/market_chart?vs_currency='+currency+'&days=' + str(days)
+    data_req = requests.get(cg_data_url)
+            
+    if count == 0:      
+        price = pd.DataFrame(index = pd.DataFrame(data_req.json()['prices'])[0])
+        market_cap = pd.DataFrame(index = pd.DataFrame(data_req.json()['market_caps'])[0])
+        volume = pd.DataFrame(index = pd.DataFrame(data_req.json()['total_volumes'])[0])
+
+    try:   
+        temp = pd.DataFrame(data_req.json()['prices'])
+        temp.set_index(temp.columns[0], inplace=True)
+        price = price.merge(temp, left_index=True, right_index=True, how='outer')
+        price.rename(columns={1:coin}, inplace=True)
+
+        temp = pd.DataFrame(data_req.json()['market_caps'])
+        temp.set_index(temp.columns[0], inplace=True)
+        market_cap = market_cap.merge(temp, left_index=True, right_index=True, how='outer')
+        market_cap.rename(columns={1:coin}, inplace=True)
+
+        temp = pd.DataFrame(data_req.json()['total_volumes'])
+        temp.set_index(temp.columns[0], inplace=True)
+        volume = volume.merge(temp, left_index=True, right_index=True, how='outer')
+        volume.rename(columns={1:coin}, inplace=True)
+
+    except ValueError:
+        print("API requests limit reached --------------------------")
+        print(data_req)
+        
+    return price, market_cap, volume
+    
+# Get List of Available Tokens on DeFiLlama
+protocols_url = 'https://api.llama.fi/protocols'
+res = requests.get(protocols_url)
+protocols_list = pd.DataFrame(res.json())
+
+# Historical prices, market caps, and volume
+# coingecko free API has strict limits in terms of number of requests that can be done.
+# We need to store the results for the tokens that went through and then query again the API iteratively 
+
+today = datetime.date.today()
+coins = [i for i in protocols_list['gecko_id'].to_list() if i is not None]
+#coins = ['BTC']
+up_to_date = []
+days = 'max'
+currency = 'usd'
+count = 0
+
+# Verify if databases exist:
+try:
+    price_db = pd.read_sql('Price', engine).set_index('Date')
+    db_exists = 1
+except:
+    print("Databases does not exist yet. Creating it...")
+    db_exists = 0
+
+
+for coin in coins:
+
+    if db_exists:
+        # Checking the latest data available in the database to assess if API query is necessary
+        try:
+            coin_db = price_db[coin]
+            last_date = coin_db.index[-1]
+            if last_date == today:
+                up_to_date.append(coin)
+            
+            else:
+                price, market_cap, volume = append_coingecko(coin, currency, days, count, price, market_cap, volume)
+                count =+ 1
+
+        
+        # Coin is not available in the database
+        except:
+            price, market_cap, volume = append_coingecko(coin, currency, days, count, price, market_cap, volume)
+            count =+ 1
+
+            
+    else:
+        price, market_cap, volume = append_coingecko(coin, currency, days, count, price, market_cap, volume)
+        count =+ 1
+    
+
+print("These coins were already up to date: " + up_to_date)
+
+    
+# convert UNIX timestamp
+price.index = pd.to_datetime(price.index, unit='ms').rename('Date')
+market_cap.index = pd.to_datetime(market_cap.index, unit='ms').rename('Date')
+volume.index = pd.to_datetime(volume.index, unit='ms').rename('Date')
+
+# drop the latest intra-day data
+price = price.drop(price[price.index.time != datetime.time(0, 0)].index)
+market_cap = market_cap.drop(market_cap[market_cap.index.time != datetime.time(0, 0)].index)
+volume = volume.drop(volume[volume.index.time != datetime.time(0, 0)].index)
+
+
+# Store/update the result in the sql database
+
+engine = create_engine('sqlite:///CryptoDB.db')
+
+try:
+    # This will fail if there is a new column
+    price.to_sql('Price', engine, if_exists='replace')
+    market_cap.to_sql('Market Cap', engine, if_exists='append')
+    volume.to_sql('Volume', engine, if_exists='append')
+    
+except:
+    previous_price_table = pd.read_sql('SELECT * FROM Price', engine)
+    new_price_table = previous_price_table.merge(price, left_index=True, right_index=True, how='outer')
+    new_price_table.to_sql('Price', engine, if_exists = 'replace')
+
+    previous_mktcap_table = pd.read_sql('SELECT * FROM Market Cap', engine)
+    new_mktcap_table = pd.concat([previous_mktcap_table, market_cap])
+    new_mktcap_table.to_sql('Market Cap', engine, if_exists = 'replace')
+
+    previous_volume_table = pd.read_sql('SELECT * FROM Volume', engine)
+    new_volume_table = pd.concat([previous_volume_table, volume])
+    new_volume_table.to_sql('Volume', engine, if_exists = 'replace')
